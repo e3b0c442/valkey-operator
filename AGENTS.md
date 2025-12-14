@@ -398,6 +398,36 @@ This is a kubebuilder-based Kubernetes operator following the standard kubebuild
   }
   ```
 
+#### Watch Owned Resources
+- **DO:** Use `Owns()` in `SetupWithManager` to watch dependent resources (Services, StatefulSets, etc.)
+- **DON'T:** Only watch the primary resource - external changes to dependents won't trigger reconciliation
+- **Rationale:** When a Valkey reaches `Available` and returns without requeueing, external deletions or readiness changes to dependents won't emit events unless they're watched
+- **Example:**
+  ```go
+  return ctrl.NewControllerManagedBy(mgr).
+      For(&valkeyv1alpha1.Valkey{}).
+      Owns(&corev1.Service{}).
+      Owns(&appsv1.StatefulSet{}).
+      Complete(r)
+  ```
+
+#### Set Owner References in Mutate Functions
+- **DO:** Set owner references inside `controllerutil.CreateOrUpdate` mutate functions using `ctrl.SetControllerReference`
+- **DON'T:** Only set owner references in builder functions - they must be set in the mutate function to be persisted
+- **Rationale:** The mutate function is what actually updates the resource, so owner references set only in builder functions are lost
+- **Example:**
+  ```go
+  op, err := controllerutil.CreateOrUpdate(ctx, r.Client, service, func() error {
+      service.Labels = desiredService.Labels
+      service.Spec = desiredService.Spec
+      // Ensure owner reference is set for garbage collection
+      if err := ctrl.SetControllerReference(valkey, service, r.Scheme); err != nil {
+          return err
+      }
+      return nil
+  })
+  ```
+
 ## Key Files Reference
 
 ### `cmd/main.go`
@@ -516,6 +546,8 @@ This is a kubebuilder-based Kubernetes operator following the standard kubebuild
 18. **Handle NotFound errors explicitly** - Check for `errors.IsNotFound(err)` and handle resource deletion gracefully
 19. **Maintain state machine consistency** - Ensure conditions are mutually exclusive when appropriate (e.g., Available and Progressing should not both be True)
 20. **Preserve LastTransitionTime correctly** - Only update when condition status or reason actually changes
+21. **Watch owned resources** - Use `Owns()` in `SetupWithManager` to watch dependent resources so external changes trigger reconciliation
+22. **Set owner references in mutate functions** - Always set owner references inside `controllerutil.CreateOrUpdate` mutate functions, not just in builder functions
 
 ## Troubleshooting
 
@@ -613,4 +645,6 @@ This is a kubebuilder-based Kubernetes operator following the standard kubebuild
 - ❌ Allowing invalid state machine states - ensure conditions are mutually exclusive when appropriate
 - ❌ Always updating LastTransitionTime - only update when condition status or reason actually changes
 - ❌ Not handling external resource deletions - always check for NotFound and reset state machine appropriately
+- ❌ Not watching owned resources with Owns() - external changes to dependents won't trigger reconciliation
+- ❌ Setting owner references only in builder functions - must set them in controllerutil.CreateOrUpdate mutate functions
 

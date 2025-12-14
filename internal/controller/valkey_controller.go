@@ -56,6 +56,11 @@ const (
 	reasonWaitingForReady     = "WaitingForReady"
 )
 
+// Condition reasons
+const (
+	reasonAvailable = "Available"
+)
+
 // ValkeyReconciler reconciles a Valkey object
 type ValkeyReconciler struct {
 	client.Client
@@ -137,6 +142,10 @@ func (r *ValkeyReconciler) reconcileCreatingService(ctx context.Context, valkey 
 		// For headless services, the spec is mostly immutable, but we ensure labels and selectors match
 		service.Labels = desiredService.Labels
 		service.Spec = desiredService.Spec
+		// Ensure owner reference is set for garbage collection
+		if err := ctrl.SetControllerReference(valkey, service, r.Scheme); err != nil {
+			return err
+		}
 		return nil
 	})
 	if err != nil {
@@ -179,6 +188,10 @@ func (r *ValkeyReconciler) reconcileCreatingStatefulSet(ctx context.Context, val
 		// Update StatefulSet spec to match desired state
 		statefulSet.Labels = desiredStatefulSet.Labels
 		statefulSet.Spec = desiredStatefulSet.Spec
+		// Ensure owner reference is set for garbage collection
+		if err := ctrl.SetControllerReference(valkey, statefulSet, r.Scheme); err != nil {
+			return err
+		}
 		return nil
 	})
 	if err != nil {
@@ -233,8 +246,8 @@ func (r *ValkeyReconciler) reconcileWaitingForReady(ctx context.Context, valkey 
 	if statefulSet.Status.Replicas == valkeyReplicas && statefulSet.Status.ReadyReplicas == valkeyReplicas {
 		// StatefulSet is ready, set Available and clear Progressing
 		r.setCondition(valkey, conditionTypeAvailable, metav1.ConditionTrue, "StatefulSetReady", "StatefulSet is ready")
-		r.setCondition(valkey, conditionTypeProgressing, metav1.ConditionFalse, "Available", "Valkey is available")
-		r.setCondition(valkey, conditionTypeDegraded, metav1.ConditionFalse, "Available", "Valkey is available")
+		r.setCondition(valkey, conditionTypeProgressing, metav1.ConditionFalse, reasonAvailable, "Valkey is available")
+		r.setCondition(valkey, conditionTypeDegraded, metav1.ConditionFalse, reasonAvailable, "Valkey is available")
 		if err := r.Status().Update(ctx, valkey); err != nil {
 			log.Error(err, "Failed to update status")
 			return ctrl.Result{}, err
@@ -410,6 +423,8 @@ func findCondition(conditions []metav1.Condition, conditionType string) *metav1.
 func (r *ValkeyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&valkeyv1alpha1.Valkey{}).
+		Owns(&corev1.Service{}).
+		Owns(&appsv1.StatefulSet{}).
 		Named("valkey").
 		Complete(r)
 }

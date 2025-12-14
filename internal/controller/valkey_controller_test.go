@@ -402,7 +402,7 @@ var _ = Describe("Valkey Controller", func() {
 			// Verify Available is still True and Progressing is still False
 			err = k8sClient.Get(ctx, typeNamespacedName, valkey)
 			Expect(err).NotTo(HaveOccurred())
-			available = findCondition(valkey.Status.Conditions, "Available")
+			available = findCondition(valkey.Status.Conditions, conditionTypeAvailable)
 			Expect(available).NotTo(BeNil())
 			Expect(available.Status).To(Equal(metav1.ConditionTrue))
 			progressing := findCondition(valkey.Status.Conditions, conditionTypeProgressing)
