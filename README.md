@@ -1,8 +1,18 @@
 # valkey-operator
-// TODO(user): Add simple overview of use/purpose
+
+A Kubernetes operator for deploying and managing Valkey instances using Custom Resources.
 
 ## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+
+The valkey-operator provides a Kubernetes Custom Resource Definition (CRD) for managing Valkey instances. The operator follows a state machine approach to reconcile Valkey resources, deploying them as StatefulSets with headless Services.
+
+### Features
+
+- **Single-replica Valkey deployment**: Deploys Valkey as a StatefulSet with one replica
+- **State machine reconciliation**: Uses a Progressing condition to track reconciliation state
+- **Status conditions**: Provides Available, Progressing, and Degraded conditions for observability
+- **Headless Service**: Automatically creates a headless Service for StatefulSet pod discovery
+- **Default configuration**: Uses official Valkey image (`valkey/valkey:latest`) with default settings
 
 ## Getting Started
 
@@ -45,7 +55,29 @@ You can apply the samples (examples) from the config/sample:
 kubectl apply -k config/samples/
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+This will create a Valkey instance named `valkey-sample`. The operator will:
+1. Create a headless Service for the StatefulSet
+2. Create a StatefulSet with a single Valkey replica
+3. Update status conditions as the deployment progresses
+
+**Check the status of your Valkey instance:**
+
+```sh
+kubectl get valkey valkey-sample -o yaml
+```
+
+The status will show conditions:
+- **Available**: True when the StatefulSet is ready
+- **Progressing**: Tracks the current reconciliation state (CreatingService, CreatingStatefulSet, WaitingForReady)
+- **Degraded**: True if there are errors preventing normal operation
+
+**Connect to Valkey:**
+
+The headless Service is accessible at `<valkey-name>.<namespace>.svc.cluster.local:6379`. For example:
+
+```sh
+kubectl run -it --rm redis-client --image=redis:7-alpine -- redis-cli -h valkey-sample.default.svc.cluster.local -p 6379
+```
 
 ### To Uninstall
 **Delete the instances (CRs) from the cluster:**
