@@ -8,4 +8,14 @@ layout:
 - go.kubebuilder.io/v4
 projectName: valkey-operator
 repo: github.com/e3b0c442/valkey-operator
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: e3b0c442.dev
+  group: valkey
+  kind: Valkey
+  path: github.com/e3b0c442/valkey-operator/api/v1alpha1
+  version: v1alpha1
 version: "3"
