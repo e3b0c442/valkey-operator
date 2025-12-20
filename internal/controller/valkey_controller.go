@@ -160,6 +160,8 @@ func (r *ValkeyReconciler) reconcileCreatingService(ctx context.Context, valkey 
 	if op == controllerutil.OperationResultCreated {
 		log.Info("Created Service", "service", service.Name)
 		r.setCondition(valkey, conditionTypeProgressing, metav1.ConditionTrue, reasonCreatingService, "Creating headless Service")
+		// Clear Degraded condition if it was previously set due to a transient error
+		r.setCondition(valkey, conditionTypeDegraded, metav1.ConditionFalse, reasonAvailable, "Service creation succeeded")
 		if err := r.Status().Update(ctx, valkey); err != nil {
 			log.Error(err, "Failed to update status")
 			return ctrl.Result{}, err
@@ -169,6 +171,8 @@ func (r *ValkeyReconciler) reconcileCreatingService(ctx context.Context, valkey 
 
 	// Service exists, transition to CreatingStatefulSet
 	r.setCondition(valkey, conditionTypeProgressing, metav1.ConditionTrue, reasonCreatingStatefulSet, "Service exists, creating StatefulSet")
+	// Clear Degraded condition if it was previously set due to a transient error
+	r.setCondition(valkey, conditionTypeDegraded, metav1.ConditionFalse, reasonAvailable, "Service operation succeeded")
 	if err := r.Status().Update(ctx, valkey); err != nil {
 		log.Error(err, "Failed to update status")
 		return ctrl.Result{}, err
@@ -206,6 +210,8 @@ func (r *ValkeyReconciler) reconcileCreatingStatefulSet(ctx context.Context, val
 	if op == controllerutil.OperationResultCreated {
 		log.Info("Created StatefulSet", "statefulset", statefulSet.Name)
 		r.setCondition(valkey, conditionTypeProgressing, metav1.ConditionTrue, reasonCreatingStatefulSet, "Creating StatefulSet")
+		// Clear Degraded condition if it was previously set due to a transient error
+		r.setCondition(valkey, conditionTypeDegraded, metav1.ConditionFalse, reasonAvailable, "StatefulSet creation succeeded")
 		if err := r.Status().Update(ctx, valkey); err != nil {
 			log.Error(err, "Failed to update status")
 			return ctrl.Result{}, err
@@ -215,6 +221,8 @@ func (r *ValkeyReconciler) reconcileCreatingStatefulSet(ctx context.Context, val
 
 	// StatefulSet exists, transition to WaitingForReady
 	r.setCondition(valkey, conditionTypeProgressing, metav1.ConditionTrue, reasonWaitingForReady, "StatefulSet exists, waiting for ready")
+	// Clear Degraded condition if it was previously set due to a transient error
+	r.setCondition(valkey, conditionTypeDegraded, metav1.ConditionFalse, reasonAvailable, "StatefulSet operation succeeded")
 	if err := r.Status().Update(ctx, valkey); err != nil {
 		log.Error(err, "Failed to update status")
 		return ctrl.Result{}, err
