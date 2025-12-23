@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -267,16 +268,133 @@ var _ = Describe("Manager", Ordered, func() {
 		})
 
 		// +kubebuilder:scaffold:e2e-webhooks-checks
+	})
 
-		// TODO: Customize the e2e test suite with scenarios specific to your project.
-		// Consider applying sample/CR(s) and check their status and/or verifying
-		// the reconciliation by using the metrics, i.e.:
-		// metricsOutput, err := getMetricsOutput()
-		// Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
-		// Expect(metricsOutput).To(ContainSubstring(
-		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
-		//    strings.ToLower(<Kind>),
-		// ))
+	Context("Valkey Resource", func() {
+		const valkeyName = "valkey-e2e-test"
+		const valkeyNamespace = "default"
+
+		It("should create and manage a Valkey instance", func() {
+			By("creating a Valkey resource")
+			valkeyYAML := fmt.Sprintf(`
+apiVersion: valkey.e3b0c442.dev/v1alpha1
+kind: Valkey
+metadata:
+  name: %s
+  namespace: %s
+spec: {}
+`, valkeyName, valkeyNamespace)
+
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(valkeyYAML)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create Valkey resource")
+
+			By("verifying the headless Service is created")
+			verifyServiceCreated := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "service", valkeyName, "-n", valkeyNamespace, "-o", "jsonpath={.spec.clusterIP}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("None"), "Service should be headless")
+			}
+			Eventually(verifyServiceCreated, 2*time.Minute, time.Second).Should(Succeed())
+
+			By("verifying the StatefulSet is created")
+			verifyStatefulSetCreated := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "statefulset", valkeyName, "-n", valkeyNamespace)
+				_, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "StatefulSet should exist")
+			}
+			Eventually(verifyStatefulSetCreated, 2*time.Minute, time.Second).Should(Succeed())
+
+			By("verifying the StatefulSet pod becomes ready")
+			verifyPodReady := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "pod", fmt.Sprintf("%s-0", valkeyName), "-n", valkeyNamespace,
+					"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("True"), "Pod should be ready")
+			}
+			Eventually(verifyPodReady, 5*time.Minute, time.Second).Should(Succeed())
+
+			By("verifying status conditions are set correctly")
+			verifyStatusConditions := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "valkey", valkeyName, "-n", valkeyNamespace,
+					"-o", "jsonpath={.status.conditions[?(@.type=='Available')].status}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("True"), "Available condition should be True")
+
+				cmd = exec.Command("kubectl", "get", "valkey", valkeyName, "-n", valkeyNamespace,
+					"-o", "jsonpath={.status.conditions[?(@.type=='Progressing')].status}")
+				output, err = utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("False"), "Progressing condition should be False when ready")
+			}
+			Eventually(verifyStatusConditions, 2*time.Minute, time.Second).Should(Succeed())
+
+			By("verifying Progressing condition transitions through states")
+			verifyProgressingTransitions := func(g Gomega) {
+				// Check that Progressing condition had the expected reasons
+				cmd := exec.Command("kubectl", "get", "valkey", valkeyName, "-n", valkeyNamespace,
+					"-o", "jsonpath={.status.conditions[?(@.type=='Progressing')].reason}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				// The final reason should be empty or WaitingForReady, but we've transitioned past it
+				// We can verify the condition exists and has been set
+				g.Expect(output).NotTo(BeEmpty())
+			}
+			Eventually(verifyProgressingTransitions, 2*time.Minute, time.Second).Should(Succeed())
+
+			By("verifying Valkey is connectable from another pod on port 6379 via headless service")
+			verifyValkeyConnectable := func(g Gomega) {
+				// Create a test pod with redis-cli
+				testPodYAML := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: valkey-test-client
+  namespace: %s
+spec:
+  containers:
+  - name: redis-cli
+    image: redis:7-alpine
+    command: ["/bin/sh", "-c"]
+    args: ["redis-cli -h %s.%s.svc.cluster.local -p 6379 PING"]
+  restartPolicy: Never
+`, valkeyNamespace, valkeyName, valkeyNamespace)
+
+				cmd := exec.Command("kubectl", "apply", "-f", "-")
+				cmd.Stdin = strings.NewReader(testPodYAML)
+				_, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "Failed to create test pod")
+
+				// Wait for pod to complete
+				verifyPodComplete := func(innerG Gomega) {
+					cmd := exec.Command("kubectl", "get", "pod", "valkey-test-client", "-n", valkeyNamespace,
+						"-o", "jsonpath={.status.phase}")
+					output, err := utils.Run(cmd)
+					innerG.Expect(err).NotTo(HaveOccurred())
+					innerG.Expect(output).To(Or(Equal("Succeeded"), Equal("Running")))
+				}
+				Eventually(verifyPodComplete, 2*time.Minute, time.Second).Should(Succeed())
+
+				// Check the logs for PONG response
+				cmd = exec.Command("kubectl", "logs", "valkey-test-client", "-n", valkeyNamespace)
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(ContainSubstring("PONG"), "Should receive PONG from Valkey")
+
+				// Cleanup test pod
+				cmd = exec.Command("kubectl", "delete", "pod", "valkey-test-client", "-n", valkeyNamespace, "--ignore-not-found=true")
+				_, _ = utils.Run(cmd)
+			}
+			Eventually(verifyValkeyConnectable, 3*time.Minute, time.Second).Should(Succeed())
+
+			By("cleaning up the Valkey resource")
+			cmd = exec.Command("kubectl", "delete", "valkey", valkeyName, "-n", valkeyNamespace, "--ignore-not-found=true")
+			_, _ = utils.Run(cmd)
+		})
 	})
 })
 

@@ -52,7 +52,7 @@ This document provides essential information for AI agents working on this Kuber
 **Purpose:** Kubernetes operator for deploying and managing Valkey instances  
 **Domain:** e3b0c442.dev  
 **Repository:** github.com/e3b0c442/valkey-operator  
-**Status:** Bare kubebuilder scaffold (no controllers or CRDs implemented yet)
+**Status:** Initial implementation complete - Valkey resource controller implemented with single-replica StatefulSet deployment
 
 ## Technology Stack
 
@@ -311,9 +311,14 @@ This is a kubebuilder-based Kubernetes operator following the standard kubebuild
 - `// +kubebuilder:validation:...` - Validation rules for fields
 
 ### Logging Standards
-- **Use:** `ctrl.Log` or `ctrl.Log.WithName("controller-name")`
+- **Use:** `logf.FromContext(ctx)` to get logger from context in each function
+- **DO NOT:** Import `logr` directly or pass logger as function parameters
 - **Format:** Structured logging with key-value pairs
-- **Example:** `log.Info("reconciling resource", "valkey", req.NamespacedName, "phase", phase)`
+- **Example:** 
+  ```go
+  log := logf.FromContext(ctx)
+  log.Info("reconciling resource", "valkey", req.NamespacedName, "phase", phase)
+  ```
 - **Levels:** Use appropriate levels (Info, Error, Debug, V(1-10))
 
 ### Error Handling Patterns
@@ -322,6 +327,106 @@ This is a kubebuilder-based Kubernetes operator following the standard kubebuild
 - **Delayed Retry:** `ctrl.Result{RequeueAfter: time.Duration}`
 - **No Retry:** `ctrl.Result{}` (success)
 - **Always log errors** before returning them
+- **Handle NotFound errors explicitly:** When checking for resource existence, handle `errors.IsNotFound(err)` explicitly rather than returning the error. This prevents infinite error loops when resources are deleted externally.
+
+### Controller-Runtime Best Practices
+
+#### Use controllerutil.CreateOrUpdate
+- **DO:** Use `controllerutil.CreateOrUpdate` for create-or-update operations
+- **DON'T:** Manually implement Get/Create patterns
+- **Example:**
+  ```go
+  desired := r.buildService(valkey)
+  service := &corev1.Service{}
+  service.Name = desired.Name
+  service.Namespace = desired.Namespace
+  
+  op, err := controllerutil.CreateOrUpdate(ctx, r.Client, service, func() error {
+      service.Labels = desired.Labels
+      service.Spec = desired.Spec
+      return nil
+  })
+  ```
+
+#### Use Constants, Not Magic Strings
+- **DO:** Define constants for condition types, reasons, and other string literals
+- **DON'T:** Use magic strings like `"Progressing"`, `"Available"` directly in code
+- **Example:**
+  ```go
+  const (
+      conditionTypeAvailable   = "Available"
+      conditionTypeProgressing = "Progressing"
+      conditionTypeDegraded    = "Degraded"
+  )
+  ```
+
+#### Get Logger from Context
+- **DO:** Get logger from context in each function: `log := logf.FromContext(ctx)`
+- **DON'T:** Import `logr` directly or pass logger as function parameters
+- **Rationale:** This follows controller-runtime conventions and avoids unnecessary dependencies
+
+#### State Machine Consistency
+- **DO:** Ensure state machine conditions are mutually exclusive when appropriate
+- **DON'T:** Allow invalid states (e.g., both `Available=True` and `Progressing=True` simultaneously)
+- **Example:** When StatefulSet becomes not-ready, set both `Available=False` and `Progressing=True`
+
+#### Handle External Deletions
+- **DO:** Check for `errors.IsNotFound(err)` and reset state machine when resources are deleted externally
+- **DON'T:** Return NotFound errors without handling them - this causes infinite error loops
+- **Example:**
+  ```go
+  if err := r.Get(ctx, namespacedName, resource); err != nil {
+      if errors.IsNotFound(err) {
+          // Reset state machine to recreate resource
+          return r.resetToInitialState(ctx, valkey)
+      }
+      return ctrl.Result{}, err
+  }
+  ```
+
+#### Condition LastTransitionTime
+- **DO:** Only update `LastTransitionTime` when condition status or reason actually changes
+- **DON'T:** Always set `LastTransitionTime` to current time - this violates Kubernetes API conventions
+- **Example:**
+  ```go
+  lastTransitionTime := now
+  if existingCondition != nil {
+      if existingCondition.Status == status && existingCondition.Reason == reason {
+          // No transition - preserve existing LastTransitionTime
+          lastTransitionTime = existingCondition.LastTransitionTime
+      }
+  }
+  ```
+
+#### Watch Owned Resources
+- **DO:** Use `Owns()` in `SetupWithManager` to watch dependent resources (Services, StatefulSets, etc.)
+- **DON'T:** Only watch the primary resource - external changes to dependents won't trigger reconciliation
+- **Rationale:** When a Valkey reaches `Available` and returns without requeueing, external deletions or readiness changes to dependents won't emit events unless they're watched
+- **Example:**
+  ```go
+  return ctrl.NewControllerManagedBy(mgr).
+      For(&valkeyv1alpha1.Valkey{}).
+      Owns(&corev1.Service{}).
+      Owns(&appsv1.StatefulSet{}).
+      Complete(r)
+  ```
+
+#### Set Owner References in Mutate Functions
+- **DO:** Set owner references inside `controllerutil.CreateOrUpdate` mutate functions using `ctrl.SetControllerReference`
+- **DON'T:** Only set owner references in builder functions - they must be set in the mutate function to be persisted
+- **Rationale:** The mutate function is what actually updates the resource, so owner references set only in builder functions are lost
+- **Example:**
+  ```go
+  op, err := controllerutil.CreateOrUpdate(ctx, r.Client, service, func() error {
+      service.Labels = desiredService.Labels
+      service.Spec = desiredService.Spec
+      // Ensure owner reference is set for garbage collection
+      if err := ctrl.SetControllerReference(valkey, service, r.Scheme); err != nil {
+          return err
+      }
+      return nil
+  })
+  ```
 
 ## Key Files Reference
 
@@ -435,6 +540,14 @@ This is a kubebuilder-based Kubernetes operator following the standard kubebuild
 12. **Keep controllers focused** - one controller per resource type
 13. **Test locally** with `make run` before deploying
 14. **Verify tests fail first** in TDD workflow before implementation
+15. **Use `controllerutil.CreateOrUpdate`** - Prefer this over manual Get/Create patterns for idempotent operations
+16. **Use constants for string literals** - Define constants for condition types, reasons, and other magic strings
+17. **Get logger from context** - Use `logf.FromContext(ctx)` in each function rather than passing logger as parameter
+18. **Handle NotFound errors explicitly** - Check for `errors.IsNotFound(err)` and handle resource deletion gracefully
+19. **Maintain state machine consistency** - Ensure conditions are mutually exclusive when appropriate (e.g., Available and Progressing should not both be True)
+20. **Preserve LastTransitionTime correctly** - Only update when condition status or reason actually changes
+21. **Watch owned resources** - Use `Owns()` in `SetupWithManager` to watch dependent resources so external changes trigger reconciliation
+22. **Set owner references in mutate functions** - Always set owner references inside `controllerutil.CreateOrUpdate` mutate functions, not just in builder functions
 
 ## Troubleshooting
 
@@ -525,4 +638,13 @@ This is a kubebuilder-based Kubernetes operator following the standard kubebuild
 - ❌ Committing without running linters
 - ❌ Forgetting to update documentation
 - ❌ Implementing before writing tests (violates TDD)
+- ❌ Using magic strings instead of constants (e.g., `"Progressing"` instead of `conditionTypeProgressing`)
+- ❌ Importing `logr` directly - use `logf.FromContext(ctx)` instead
+- ❌ Manual Get/Create patterns - use `controllerutil.CreateOrUpdate` for idempotent operations
+- ❌ Returning NotFound errors without handling them - causes infinite error loops when resources are deleted externally
+- ❌ Allowing invalid state machine states - ensure conditions are mutually exclusive when appropriate
+- ❌ Always updating LastTransitionTime - only update when condition status or reason actually changes
+- ❌ Not handling external resource deletions - always check for NotFound and reset state machine appropriately
+- ❌ Not watching owned resources with Owns() - external changes to dependents won't trigger reconciliation
+- ❌ Setting owner references only in builder functions - must set them in controllerutil.CreateOrUpdate mutate functions
 
