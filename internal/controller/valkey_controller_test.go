@@ -25,6 +25,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -171,6 +172,13 @@ var _ = Describe("Valkey Controller", func() {
 			Expect(statefulSet.Spec.Template.Spec.Containers[0].Image).To(Equal("valkey/valkey:latest"))
 			Expect(statefulSet.Spec.Template.Spec.Containers[0].Ports).To(HaveLen(1))
 			Expect(statefulSet.Spec.Template.Spec.Containers[0].Ports[0].ContainerPort).To(Equal(int32(6379)))
+			Expect(statefulSet.Spec.VolumeClaimTemplates).To(HaveLen(1))
+			Expect(statefulSet.Spec.VolumeClaimTemplates[0].Name).To(Equal("data"))
+			Expect(statefulSet.Spec.VolumeClaimTemplates[0].Spec.Resources.Requests[corev1.ResourceStorage]).To(Equal(resource.MustParse("1Gi")))
+			Expect(statefulSet.Spec.VolumeClaimTemplates[0].Spec.AccessModes).To(ContainElement(corev1.ReadWriteOnce))
+			Expect(statefulSet.Spec.Template.Spec.Containers[0].VolumeMounts).To(HaveLen(1))
+			Expect(statefulSet.Spec.Template.Spec.Containers[0].VolumeMounts[0].Name).To(Equal("data"))
+			Expect(statefulSet.Spec.Template.Spec.Containers[0].VolumeMounts[0].MountPath).To(Equal("/data"))
 		})
 
 		It("should set Progressing condition with CreatingStatefulSet reason when creating StatefulSet", func() {
