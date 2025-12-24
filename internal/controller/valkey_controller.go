@@ -36,10 +36,12 @@ import (
 )
 
 const (
-	valkeyImage    = "valkey/valkey:latest"
-	valkeyPort     = int32(6379)
-	valkeyReplicas = int32(1)
-	valkeyAppName  = "valkey"
+	valkeyImage      = "valkey/valkey:latest"
+	valkeyPort       = int32(6379)
+	valkeyReplicas   = int32(1)
+	valkeyAppName    = "valkey"
+	primaryRoleLabel = "valkey.e3b0c442.dev/role"
+	primaryRoleValue = "primary"
 )
 
 // Condition types
@@ -252,6 +254,46 @@ func (r *ValkeyReconciler) reconcileWaitingForReady(ctx context.Context, valkey 
 
 	// Check if StatefulSet is ready
 	if statefulSet.Status.Replicas == valkeyReplicas && statefulSet.Status.ReadyReplicas == valkeyReplicas {
+		// StatefulSet is ready, ensure primary service exists
+		desiredPrimaryService := r.buildPrimaryService(valkey)
+		primaryService := &corev1.Service{}
+		primaryService.Name = desiredPrimaryService.Name
+		primaryService.Namespace = desiredPrimaryService.Namespace
+
+		op, err := controllerutil.CreateOrUpdate(ctx, r.Client, primaryService, func() error {
+			primaryService.Labels = desiredPrimaryService.Labels
+			// Only update mutable fields to avoid overwriting immutable server-assigned fields
+			// like ClusterIP, ClusterIPs, etc. when the service already exists
+			if primaryService.UID != "" {
+				// Service exists - only update mutable fields
+				primaryService.Spec.Ports = desiredPrimaryService.Spec.Ports
+				primaryService.Spec.Selector = desiredPrimaryService.Spec.Selector
+				primaryService.Spec.Type = desiredPrimaryService.Spec.Type
+			} else {
+				// Service doesn't exist - set entire spec for creation
+				primaryService.Spec = desiredPrimaryService.Spec
+			}
+			// Ensure owner reference is set for garbage collection
+			if err := ctrl.SetControllerReference(valkey, primaryService, r.Scheme); err != nil {
+				return err
+			}
+			return nil
+		})
+		if err != nil {
+			log.Error(err, "Failed to create or update primary Service")
+			r.setCondition(valkey, conditionTypeAvailable, metav1.ConditionFalse, "PrimaryServiceCreationFailed", fmt.Sprintf("Failed to create primary Service: %v", err))
+			r.setCondition(valkey, conditionTypeProgressing, metav1.ConditionTrue, reasonWaitingForReady, fmt.Sprintf("Retrying primary service creation after failure: %v", err))
+			r.setCondition(valkey, conditionTypeDegraded, metav1.ConditionTrue, "PrimaryServiceCreationFailed", fmt.Sprintf("Failed to create primary Service: %v", err))
+			if updateErr := r.Status().Update(ctx, valkey); updateErr != nil {
+				log.Error(updateErr, "Failed to update status")
+			}
+			return ctrl.Result{}, err
+		}
+
+		if op == controllerutil.OperationResultCreated {
+			log.Info("Created primary Service", "service", primaryService.Name)
+		}
+
 		// StatefulSet is ready, set Available and clear Progressing
 		r.setCondition(valkey, conditionTypeAvailable, metav1.ConditionTrue, "StatefulSetReady", "StatefulSet is ready")
 		r.setCondition(valkey, conditionTypeProgressing, metav1.ConditionFalse, reasonAvailable, "Valkey is available")
@@ -313,6 +355,45 @@ func (r *ValkeyReconciler) buildService(valkey *valkeyv1alpha1.Valkey) *corev1.S
 	return service
 }
 
+// buildPrimaryService builds a Service that selects only the primary pod
+func (r *ValkeyReconciler) buildPrimaryService(valkey *valkeyv1alpha1.Valkey) *corev1.Service {
+	labels := map[string]string{
+		"app.kubernetes.io/name":       valkeyAppName,
+		"app.kubernetes.io/instance":   valkey.Name,
+		"app.kubernetes.io/managed-by": "valkey-operator",
+	}
+
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      valkey.Name + "-primary",
+			Namespace: valkey.Namespace,
+			Labels:    labels,
+		},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "valkey",
+					Port:       valkeyPort,
+					TargetPort: intstr.FromInt32(valkeyPort),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+			Selector: map[string]string{
+				"app.kubernetes.io/name":     valkeyAppName,
+				"app.kubernetes.io/instance": valkey.Name,
+				primaryRoleLabel:             primaryRoleValue,
+			},
+		},
+	}
+
+	// Set owner reference
+	if err := ctrl.SetControllerReference(valkey, service, r.Scheme); err != nil {
+		// This should not happen in normal operation
+		panic(fmt.Sprintf("failed to set controller reference: %v", err))
+	}
+	return service
+}
+
 // buildStatefulSet builds a StatefulSet for the Valkey instance
 func (r *ValkeyReconciler) buildStatefulSet(valkey *valkeyv1alpha1.Valkey) *appsv1.StatefulSet {
 	labels := map[string]string{
@@ -320,6 +401,13 @@ func (r *ValkeyReconciler) buildStatefulSet(valkey *valkeyv1alpha1.Valkey) *apps
 		"app.kubernetes.io/instance":   valkey.Name,
 		"app.kubernetes.io/managed-by": "valkey-operator",
 	}
+
+	// Add primary label to pod template since we only have one replica for now
+	podLabels := make(map[string]string)
+	for k, v := range labels {
+		podLabels[k] = v
+	}
+	podLabels[primaryRoleLabel] = primaryRoleValue
 
 	replicas := valkeyReplicas
 	statefulSet := &appsv1.StatefulSet{
@@ -339,7 +427,7 @@ func (r *ValkeyReconciler) buildStatefulSet(valkey *valkeyv1alpha1.Valkey) *apps
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: labels,
+					Labels: podLabels,
 				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
