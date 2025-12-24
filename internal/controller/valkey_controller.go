@@ -56,9 +56,10 @@ const (
 
 // State machine reasons for Progressing condition
 const (
-	reasonCreatingService     = "CreatingService"
-	reasonCreatingStatefulSet = "CreatingStatefulSet"
-	reasonWaitingForReady     = "WaitingForReady"
+	reasonCreatingService      = "CreatingService"
+	reasonCreatingStatefulSet  = "CreatingStatefulSet"
+	reasonWaitingForReady      = "WaitingForReady"
+	reasonMigratingStatefulSet = "MigratingStatefulSet"
 )
 
 // Condition reasons
@@ -116,6 +117,9 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	case reasonCreatingService:
 		return r.reconcileCreatingService(ctx, valkey)
 	case reasonCreatingStatefulSet:
+		return r.reconcileCreatingStatefulSet(ctx, valkey)
+	case reasonMigratingStatefulSet:
+		// Migration state: StatefulSet was deleted, recreate it with persistence
 		return r.reconcileCreatingStatefulSet(ctx, valkey)
 	case reasonWaitingForReady:
 		return r.reconcileWaitingForReady(ctx, valkey)
@@ -192,6 +196,41 @@ func (r *ValkeyReconciler) reconcileCreatingStatefulSet(ctx context.Context, val
 	statefulSet := &appsv1.StatefulSet{}
 	statefulSet.Name = desiredStatefulSet.Name
 	statefulSet.Namespace = desiredStatefulSet.Namespace
+
+	// Check if StatefulSet exists and needs migration (has no VolumeClaimTemplates)
+	existingStatefulSet := &appsv1.StatefulSet{}
+	err := r.Get(ctx, types.NamespacedName{Name: statefulSet.Name, Namespace: statefulSet.Namespace}, existingStatefulSet)
+	if err == nil {
+		// StatefulSet exists - check if it needs migration
+		needsMigration := len(existingStatefulSet.Spec.VolumeClaimTemplates) == 0 && len(desiredStatefulSet.Spec.VolumeClaimTemplates) > 0
+		if needsMigration {
+			log.Info("StatefulSet exists without VolumeClaimTemplates, migrating by deleting and recreating", "statefulset", existingStatefulSet.Name)
+			r.setCondition(valkey, conditionTypeProgressing, metav1.ConditionTrue, reasonMigratingStatefulSet, "Migrating StatefulSet to add persistence")
+			r.setCondition(valkey, conditionTypeAvailable, metav1.ConditionFalse, "MigratingStatefulSet", "StatefulSet is being migrated to add persistence")
+			if updateErr := r.Status().Update(ctx, valkey); updateErr != nil {
+				log.Error(updateErr, "Failed to update status")
+				return ctrl.Result{}, updateErr
+			}
+
+			// Delete the existing StatefulSet to allow recreation with VolumeClaimTemplates
+			if err := r.Delete(ctx, existingStatefulSet); err != nil {
+				log.Error(err, "Failed to delete StatefulSet for migration")
+				r.setCondition(valkey, conditionTypeDegraded, metav1.ConditionTrue, "StatefulSetMigrationFailed", fmt.Sprintf("Failed to delete StatefulSet for migration: %v", err))
+				if updateErr := r.Status().Update(ctx, valkey); updateErr != nil {
+					log.Error(updateErr, "Failed to update status")
+				}
+				return ctrl.Result{}, err
+			}
+
+			log.Info("Deleted StatefulSet for migration, will recreate with persistence", "statefulset", existingStatefulSet.Name)
+			// Requeue to recreate the StatefulSet
+			return ctrl.Result{Requeue: true}, nil
+		}
+	} else if !errors.IsNotFound(err) {
+		// Error other than NotFound
+		log.Error(err, "Failed to get StatefulSet")
+		return ctrl.Result{}, err
+	}
 
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, statefulSet, func() error {
 		// Update StatefulSet spec to match desired state

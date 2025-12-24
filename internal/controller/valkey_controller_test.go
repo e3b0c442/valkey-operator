@@ -723,5 +723,110 @@ var _ = Describe("Valkey Controller", func() {
 			Expect(primaryService.Spec.Ports).To(HaveLen(1))
 			Expect(primaryService.Spec.Ports[0].Port).To(Equal(int32(6379)))
 		})
+
+		It("should migrate StatefulSet without VolumeClaimTemplates by deleting and recreating", func() {
+			By("Creating a StatefulSet without VolumeClaimTemplates (simulating old installation)")
+			controllerReconciler := &ValkeyReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			// Create Service first
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Create StatefulSet manually without VolumeClaimTemplates
+			oldStatefulSet := &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resourceName,
+					Namespace: namespace,
+				},
+				Spec: appsv1.StatefulSetSpec{
+					Replicas:    func() *int32 { r := int32(1); return &r }(),
+					ServiceName: resourceName,
+					Selector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							"app.kubernetes.io/name":     "valkey",
+							"app.kubernetes.io/instance": resourceName,
+						},
+					},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: map[string]string{
+								"app.kubernetes.io/name":     "valkey",
+								"app.kubernetes.io/instance": resourceName,
+							},
+						},
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									Name:  "valkey",
+									Image: "valkey/valkey:latest",
+								},
+							},
+						},
+					},
+					// No VolumeClaimTemplates - simulating old installation
+				},
+			}
+			err = k8sClient.Create(ctx, oldStatefulSet)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Set state to CreatingStatefulSet - refresh valkey first
+			err = k8sClient.Get(ctx, typeNamespacedName, valkey)
+			Expect(err).NotTo(HaveOccurred())
+			valkey.Status.Conditions = []metav1.Condition{
+				{
+					Type:               "Progressing",
+					Status:             metav1.ConditionTrue,
+					Reason:             reasonCreatingStatefulSet,
+					Message:            "Creating StatefulSet",
+					LastTransitionTime: metav1.Now(),
+					ObservedGeneration: valkey.Generation,
+				},
+			}
+			err = k8sClient.Status().Update(ctx, valkey)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Reconciling should detect migration needed and delete the old StatefulSet")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify StatefulSet was deleted
+			deletedStatefulSet := &appsv1.StatefulSet{}
+			err = k8sClient.Get(ctx, typeNamespacedName, deletedStatefulSet)
+			Expect(errors.IsNotFound(err)).To(BeTrue(), "StatefulSet should be deleted for migration")
+
+			// Verify migration condition is set
+			err = k8sClient.Get(ctx, typeNamespacedName, valkey)
+			Expect(err).NotTo(HaveOccurred())
+			progressing := findCondition(valkey.Status.Conditions, conditionTypeProgressing)
+			Expect(progressing).NotTo(BeNil())
+			Expect(progressing.Reason).To(Equal(reasonMigratingStatefulSet))
+
+			By("Reconciling again should recreate StatefulSet with VolumeClaimTemplates")
+			// Reconcile multiple times to ensure StatefulSet is created
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Reconcile again to create the StatefulSet
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify StatefulSet was recreated with VolumeClaimTemplates
+			newStatefulSet := &appsv1.StatefulSet{}
+			err = k8sClient.Get(ctx, typeNamespacedName, newStatefulSet)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(newStatefulSet.Spec.VolumeClaimTemplates).To(HaveLen(1))
+			Expect(newStatefulSet.Spec.VolumeClaimTemplates[0].Name).To(Equal("data"))
+		})
 	})
 })
