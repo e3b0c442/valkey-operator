@@ -75,6 +75,17 @@ var _ = Describe("Valkey Controller", func() {
 				Expect(k8sClient.Delete(ctx, service)).To(Succeed())
 			}
 
+			By("cleaning up the primary Service if it exists")
+			primaryServiceName := types.NamespacedName{
+				Name:      resourceName + "-primary",
+				Namespace: namespace,
+			}
+			primaryService := &corev1.Service{}
+			err = k8sClient.Get(ctx, primaryServiceName, primaryService)
+			if err == nil {
+				Expect(k8sClient.Delete(ctx, primaryService)).To(Succeed())
+			}
+
 			By("cleaning up the StatefulSet if it exists")
 			statefulSet := &appsv1.StatefulSet{}
 			err = k8sClient.Get(ctx, typeNamespacedName, statefulSet)
@@ -612,6 +623,97 @@ var _ = Describe("Valkey Controller", func() {
 			Expect(progressing).NotTo(BeNil())
 			Expect(progressing.Status).To(Equal(metav1.ConditionTrue))
 			Expect(progressing.Reason).To(Equal(reasonWaitingForReady))
+		})
+
+		It("should label the primary pod in StatefulSet", func() {
+			By("Reconciling to create Service and StatefulSet")
+			controllerReconciler := &ValkeyReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			// Create Service
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Create StatefulSet
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("verifying the StatefulSet pod template has primary label")
+			statefulSet := &appsv1.StatefulSet{}
+			err = k8sClient.Get(ctx, typeNamespacedName, statefulSet)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(statefulSet.Spec.Template.Labels).To(HaveKeyWithValue("valkey.e3b0c442.dev/role", "primary"))
+		})
+
+		It("should create a primary Service that selects primary pods", func() {
+			By("Reconciling to create Service and StatefulSet")
+			controllerReconciler := &ValkeyReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			// Create headless Service
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Create StatefulSet
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Make StatefulSet ready to trigger primary service creation
+			statefulSet := &appsv1.StatefulSet{}
+			err = k8sClient.Get(ctx, typeNamespacedName, statefulSet)
+			Expect(err).NotTo(HaveOccurred())
+			statefulSet.Status.Replicas = 1
+			statefulSet.Status.ReadyReplicas = 1
+			err = k8sClient.Status().Update(ctx, statefulSet)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Reconcile to check readiness and create primary service
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Reconcile again to create primary service
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("verifying the primary Service was created")
+			primaryServiceName := types.NamespacedName{
+				Name:      resourceName + "-primary",
+				Namespace: namespace,
+			}
+			primaryService := &corev1.Service{}
+			err = k8sClient.Get(ctx, primaryServiceName, primaryService)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(primaryService.Spec.Selector).To(HaveKeyWithValue("valkey.e3b0c442.dev/role", "primary"))
+			Expect(primaryService.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/name", "valkey"))
+			Expect(primaryService.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/instance", resourceName))
+			Expect(primaryService.Spec.Ports).To(HaveLen(1))
+			Expect(primaryService.Spec.Ports[0].Port).To(Equal(int32(6379)))
 		})
 	})
 })

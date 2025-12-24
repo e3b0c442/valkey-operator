@@ -391,6 +391,70 @@ spec:
 			}
 			Eventually(verifyValkeyConnectable, 3*time.Minute, time.Second).Should(Succeed())
 
+			By("verifying the primary Service is created")
+			verifyPrimaryServiceCreated := func(g Gomega) {
+				primaryServiceName := valkeyName + "-primary"
+				cmd := exec.Command("kubectl", "get", "service", primaryServiceName, "-n", valkeyNamespace)
+				_, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "Primary service should exist")
+			}
+			Eventually(verifyPrimaryServiceCreated, 2*time.Minute, time.Second).Should(Succeed())
+
+			By("verifying the primary pod is labeled")
+			verifyPrimaryPodLabeled := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "pod", fmt.Sprintf("%s-0", valkeyName), "-n", valkeyNamespace,
+					"-o", "jsonpath={.metadata.labels.valkey\\.e3b0c442\\.dev/role}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("primary"), "Primary pod should have role=primary label")
+			}
+			Eventually(verifyPrimaryPodLabeled, 2*time.Minute, time.Second).Should(Succeed())
+
+			By("verifying Valkey is connectable via primary service")
+			verifyValkeyConnectableViaPrimary := func(g Gomega) {
+				// Create a test pod with redis-cli
+				testPodYAML := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: valkey-test-client-primary
+  namespace: %s
+spec:
+  containers:
+  - name: redis-cli
+    image: redis:7-alpine
+    command: ["/bin/sh", "-c"]
+    args: ["redis-cli -h %s-primary.%s.svc.cluster.local -p 6379 PING"]
+  restartPolicy: Never
+`, valkeyNamespace, valkeyName, valkeyNamespace)
+
+				cmd := exec.Command("kubectl", "apply", "-f", "-")
+				cmd.Stdin = strings.NewReader(testPodYAML)
+				_, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "Failed to create test pod")
+
+				// Wait for pod to complete
+				verifyPodComplete := func(innerG Gomega) {
+					cmd := exec.Command("kubectl", "get", "pod", "valkey-test-client-primary", "-n", valkeyNamespace,
+						"-o", "jsonpath={.status.phase}")
+					output, err := utils.Run(cmd)
+					innerG.Expect(err).NotTo(HaveOccurred())
+					innerG.Expect(output).To(Or(Equal("Succeeded"), Equal("Running")))
+				}
+				Eventually(verifyPodComplete, 2*time.Minute, time.Second).Should(Succeed())
+
+				// Check the logs for PONG response
+				cmd = exec.Command("kubectl", "logs", "valkey-test-client-primary", "-n", valkeyNamespace)
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(ContainSubstring("PONG"), "Should receive PONG from Valkey via primary service")
+
+				// Cleanup test pod
+				cmd = exec.Command("kubectl", "delete", "pod", "valkey-test-client-primary", "-n", valkeyNamespace, "--ignore-not-found=true")
+				_, _ = utils.Run(cmd)
+			}
+			Eventually(verifyValkeyConnectableViaPrimary, 3*time.Minute, time.Second).Should(Succeed())
+
 			By("cleaning up the Valkey resource")
 			cmd = exec.Command("kubectl", "delete", "valkey", valkeyName, "-n", valkeyNamespace, "--ignore-not-found=true")
 			_, _ = utils.Run(cmd)
