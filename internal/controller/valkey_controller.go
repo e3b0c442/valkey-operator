@@ -262,7 +262,17 @@ func (r *ValkeyReconciler) reconcileWaitingForReady(ctx context.Context, valkey 
 
 		op, err := controllerutil.CreateOrUpdate(ctx, r.Client, primaryService, func() error {
 			primaryService.Labels = desiredPrimaryService.Labels
-			primaryService.Spec = desiredPrimaryService.Spec
+			// Only update mutable fields to avoid overwriting immutable server-assigned fields
+			// like ClusterIP, ClusterIPs, etc. when the service already exists
+			if primaryService.UID != "" {
+				// Service exists - only update mutable fields
+				primaryService.Spec.Ports = desiredPrimaryService.Spec.Ports
+				primaryService.Spec.Selector = desiredPrimaryService.Spec.Selector
+				primaryService.Spec.Type = desiredPrimaryService.Spec.Type
+			} else {
+				// Service doesn't exist - set entire spec for creation
+				primaryService.Spec = desiredPrimaryService.Spec
+			}
 			// Ensure owner reference is set for garbage collection
 			if err := ctrl.SetControllerReference(valkey, primaryService, r.Scheme); err != nil {
 				return err
