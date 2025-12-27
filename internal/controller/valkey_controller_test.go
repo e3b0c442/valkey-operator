@@ -774,6 +774,11 @@ var _ = Describe("Valkey Controller", func() {
 			err = k8sClient.Create(ctx, oldStatefulSet)
 			Expect(err).NotTo(HaveOccurred())
 
+			// Set StatefulSet status to have 0 ready replicas (safe to migrate)
+			oldStatefulSet.Status.ReadyReplicas = 0
+			err = k8sClient.Status().Update(ctx, oldStatefulSet)
+			Expect(err).NotTo(HaveOccurred())
+
 			// Set state to CreatingStatefulSet - refresh valkey first
 			err = k8sClient.Get(ctx, typeNamespacedName, valkey)
 			Expect(err).NotTo(HaveOccurred())
@@ -827,6 +832,112 @@ var _ = Describe("Valkey Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(newStatefulSet.Spec.VolumeClaimTemplates).To(HaveLen(1))
 			Expect(newStatefulSet.Spec.VolumeClaimTemplates[0].Name).To(Equal("data"))
+		})
+
+		It("should block migration when StatefulSet has ready replicas to prevent data loss", func() {
+			By("Creating a StatefulSet without VolumeClaimTemplates with ready replicas")
+			controllerReconciler := &ValkeyReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			// Create Service first
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Create StatefulSet manually without VolumeClaimTemplates
+			oldStatefulSet := &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resourceName,
+					Namespace: namespace,
+				},
+				Spec: appsv1.StatefulSetSpec{
+					Replicas:    func() *int32 { r := int32(1); return &r }(),
+					ServiceName: resourceName,
+					Selector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							"app.kubernetes.io/name":     "valkey",
+							"app.kubernetes.io/instance": resourceName,
+						},
+					},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: map[string]string{
+								"app.kubernetes.io/name":     "valkey",
+								"app.kubernetes.io/instance": resourceName,
+							},
+						},
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									Name:  "valkey",
+									Image: "valkey/valkey:latest",
+								},
+							},
+						},
+					},
+					// No VolumeClaimTemplates - simulating old installation
+				},
+			}
+			err = k8sClient.Create(ctx, oldStatefulSet)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Set StatefulSet status to have ready replicas (migration should be blocked)
+			oldStatefulSet.Status.Replicas = 1
+			oldStatefulSet.Status.ReadyReplicas = 1
+			err = k8sClient.Status().Update(ctx, oldStatefulSet)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Set state to CreatingStatefulSet - refresh valkey first
+			err = k8sClient.Get(ctx, typeNamespacedName, valkey)
+			Expect(err).NotTo(HaveOccurred())
+			valkey.Status.Conditions = []metav1.Condition{
+				{
+					Type:               "Progressing",
+					Status:             metav1.ConditionTrue,
+					Reason:             reasonCreatingStatefulSet,
+					Message:            "Creating StatefulSet",
+					LastTransitionTime: metav1.Now(),
+					ObservedGeneration: valkey.Generation,
+				},
+			}
+			err = k8sClient.Status().Update(ctx, valkey)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Reconciling should detect migration needed but block it due to ready replicas")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify StatefulSet was NOT deleted
+			existingStatefulSet := &appsv1.StatefulSet{}
+			err = k8sClient.Get(ctx, typeNamespacedName, existingStatefulSet)
+			Expect(err).NotTo(HaveOccurred(), "StatefulSet should not be deleted when migration is blocked")
+
+			// Verify Progressing condition is set correctly
+			err = k8sClient.Get(ctx, typeNamespacedName, valkey)
+			Expect(err).NotTo(HaveOccurred())
+			progressing := findCondition(valkey.Status.Conditions, conditionTypeProgressing)
+			Expect(progressing).NotTo(BeNil())
+			Expect(progressing.Status).To(Equal(metav1.ConditionTrue))
+			Expect(progressing.Reason).To(Equal(reasonWaitingForScaleDown))
+			Expect(progressing.Message).To(ContainSubstring("Waiting for StatefulSet to be scaled down"))
+
+			// Verify Degraded condition is set with migration blocked reason
+			degraded := findCondition(valkey.Status.Conditions, conditionTypeDegraded)
+			Expect(degraded).NotTo(BeNil())
+			Expect(degraded.Status).To(Equal(metav1.ConditionTrue))
+			Expect(degraded.Reason).To(Equal("MigrationRequiresScaleDown"))
+			Expect(degraded.Message).To(ContainSubstring("Scale the StatefulSet to 0 replicas"))
+
+			// Verify Available condition is False with MigrationBlocked reason
+			available := findCondition(valkey.Status.Conditions, conditionTypeAvailable)
+			Expect(available).NotTo(BeNil())
+			Expect(available.Status).To(Equal(metav1.ConditionFalse))
+			Expect(available.Reason).To(Equal("MigrationBlocked"))
 		})
 	})
 })

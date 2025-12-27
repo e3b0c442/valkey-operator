@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -60,6 +61,7 @@ const (
 	reasonCreatingStatefulSet  = "CreatingStatefulSet"
 	reasonWaitingForReady      = "WaitingForReady"
 	reasonMigratingStatefulSet = "MigratingStatefulSet"
+	reasonWaitingForScaleDown  = "WaitingForScaleDown"
 )
 
 // Condition reasons
@@ -120,6 +122,9 @@ func (r *ValkeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return r.reconcileCreatingStatefulSet(ctx, valkey)
 	case reasonMigratingStatefulSet:
 		// Migration state: StatefulSet was deleted, recreate it with persistence
+		return r.reconcileCreatingStatefulSet(ctx, valkey)
+	case reasonWaitingForScaleDown:
+		// Waiting for user to scale down StatefulSet before migration
 		return r.reconcileCreatingStatefulSet(ctx, valkey)
 	case reasonWaitingForReady:
 		return r.reconcileWaitingForReady(ctx, valkey)
@@ -204,9 +209,29 @@ func (r *ValkeyReconciler) reconcileCreatingStatefulSet(ctx context.Context, val
 		// StatefulSet exists - check if it needs migration
 		needsMigration := len(existingStatefulSet.Spec.VolumeClaimTemplates) == 0 && len(desiredStatefulSet.Spec.VolumeClaimTemplates) > 0
 		if needsMigration {
-			log.Info("StatefulSet exists without VolumeClaimTemplates, migrating by deleting and recreating", "statefulset", existingStatefulSet.Name)
+			// Safety check: Only migrate if StatefulSet has no ready replicas to prevent data loss
+			if existingStatefulSet.Status.ReadyReplicas > 0 {
+				log.Info("StatefulSet has ready replicas, migration requires scaling down first to prevent data loss",
+					"statefulset", existingStatefulSet.Name,
+					"readyReplicas", existingStatefulSet.Status.ReadyReplicas)
+				r.setCondition(valkey, conditionTypeProgressing, metav1.ConditionTrue, reasonWaitingForScaleDown, fmt.Sprintf("Waiting for StatefulSet to be scaled down to 0 replicas before migration. Current ready replicas: %d", existingStatefulSet.Status.ReadyReplicas))
+				r.setCondition(valkey, conditionTypeDegraded, metav1.ConditionTrue, "MigrationRequiresScaleDown",
+					fmt.Sprintf("Migration to add persistence requires scaling down StatefulSet first. Current ready replicas: %d. Scale the StatefulSet to 0 replicas to proceed with migration.", existingStatefulSet.Status.ReadyReplicas))
+				r.setCondition(valkey, conditionTypeAvailable, metav1.ConditionFalse, "MigrationBlocked", "Migration blocked: StatefulSet must be scaled down to 0 replicas before migration")
+				if updateErr := r.Status().Update(ctx, valkey); updateErr != nil {
+					log.Error(updateErr, "Failed to update status")
+					return ctrl.Result{}, updateErr
+				}
+				// Requeue to check again after user scales down
+				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+			}
+
+			log.Info("StatefulSet exists without VolumeClaimTemplates and has no ready replicas, migrating by deleting and recreating",
+				"statefulset", existingStatefulSet.Name,
+				"readyReplicas", existingStatefulSet.Status.ReadyReplicas)
 			r.setCondition(valkey, conditionTypeProgressing, metav1.ConditionTrue, reasonMigratingStatefulSet, "Migrating StatefulSet to add persistence")
 			r.setCondition(valkey, conditionTypeAvailable, metav1.ConditionFalse, "MigratingStatefulSet", "StatefulSet is being migrated to add persistence")
+			r.setCondition(valkey, conditionTypeDegraded, metav1.ConditionFalse, reasonAvailable, "Migration in progress")
 			if updateErr := r.Status().Update(ctx, valkey); updateErr != nil {
 				log.Error(updateErr, "Failed to update status")
 				return ctrl.Result{}, updateErr
@@ -235,7 +260,17 @@ func (r *ValkeyReconciler) reconcileCreatingStatefulSet(ctx context.Context, val
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, statefulSet, func() error {
 		// Update StatefulSet spec to match desired state
 		statefulSet.Labels = desiredStatefulSet.Labels
-		statefulSet.Spec = desiredStatefulSet.Spec
+		// Only update mutable fields to avoid overwriting immutable fields
+		// like ServiceName, Selector, and VolumeClaimTemplates when the StatefulSet already exists
+		if statefulSet.UID != "" {
+			// StatefulSet exists - only update mutable fields
+			statefulSet.Spec.Replicas = desiredStatefulSet.Spec.Replicas
+			statefulSet.Spec.Template = desiredStatefulSet.Spec.Template
+			// Do not update immutable fields: ServiceName, Selector, VolumeClaimTemplates
+		} else {
+			// StatefulSet doesn't exist - set entire spec for creation
+			statefulSet.Spec = desiredStatefulSet.Spec
+		}
 		// Ensure owner reference is set for garbage collection
 		if err := ctrl.SetControllerReference(valkey, statefulSet, r.Scheme); err != nil {
 			return err
