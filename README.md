@@ -14,7 +14,6 @@ The valkey-operator provides a Kubernetes Custom Resource Definition (CRD) for m
 - **Status conditions**: Provides Available, Progressing, and Degraded conditions for observability
 - **Headless Service**: Automatically creates a headless Service for StatefulSet pod discovery
 - **Primary Service**: Creates a Service that selects only the primary pod for read/write operations
-- **Automatic migration**: Safely migrates existing StatefulSets to add persistence when upgrading
 - **Default configuration**: Uses official Valkey image (`valkey/valkey:latest`) with default settings
 
 ## Getting Started
@@ -71,10 +70,10 @@ kubectl get valkey valkey-sample -o yaml
 
 The status will show conditions:
 - **Available**: True when the StatefulSet is ready
-- **Progressing**: Tracks the current reconciliation state (CreatingService, CreatingStatefulSet, WaitingForReady, MigratingStatefulSet, WaitingForScaleDown)
+- **Progressing**: Tracks the current reconciliation state (CreatingService, CreatingStatefulSet, WaitingForReady)
 - **Degraded**: True if there are errors preventing normal operation
 
-## Persistence and Migration
+## Persistence
 
 ### Persistent Storage
 
@@ -85,31 +84,6 @@ The operator automatically provisions persistent storage for each Valkey instanc
 - **Volume type**: PersistentVolumeClaim created via StatefulSet VolumeClaimTemplates
 
 Data stored in Valkey will persist across pod restarts and StatefulSet updates.
-
-### Migration from Non-Persistent Deployments
-
-When upgrading from an operator version without persistence, the operator will automatically detect and migrate existing StatefulSets. The migration process:
-
-1. **Detection**: Operator detects StatefulSet without `VolumeClaimTemplates`
-2. **Safety check**: Verifies StatefulSet has no ready replicas (to prevent data loss)
-3. **Migration blocking**: If replicas are running, migration is blocked with clear status messages:
-   - `Progressing=True` with reason `WaitingForScaleDown`
-   - `Degraded=True` with reason `MigrationRequiresScaleDown`
-   - `Available=False` with reason `MigrationBlocked`
-4. **User action required**: Scale down the StatefulSet to 0 replicas:
-   ```sh
-   kubectl scale statefulset <valkey-name> --replicas=0
-   ```
-5. **Automatic migration**: Once scaled down, the operator automatically:
-   - Deletes the old StatefulSet
-   - Recreates it with persistent storage
-   - Restores the original replica count
-6. **Scale back up**: After migration completes, scale back up:
-   ```sh
-   kubectl scale statefulset <valkey-name> --replicas=1
-   ```
-
-**Important**: Migration requires scaling down to prevent data loss. The operator will not delete StatefulSets with running pods. Check the status conditions to see if migration is blocked and follow the instructions in the Degraded condition message.
 
 **Connect to Valkey:**
 
