@@ -372,25 +372,32 @@ This is a kubebuilder-based Kubernetes operator following the standard kubebuild
 
 #### StatefulSet Migration for Persistence
 - **DO:** Check for existing StatefulSets without `VolumeClaimTemplates` and migrate them safely
-- **DO:** Block migration when StatefulSet has ready replicas to prevent data loss
+- **DO:** Block migration when StatefulSet is scaled up (Spec.Replicas > 0 or Status.Replicas > 0) to prevent data loss
+- **DO:** Verify StatefulSet is actually scaled down to 0 replicas, not just unready
 - **DO:** Update all state machine conditions (Progressing, Available, Degraded) when migration is blocked
 - **DON'T:** Delete StatefulSets with running pods - this causes data loss
+- **DON'T:** Only check ReadyReplicas - pods can be unready but still running (CrashLoopBackOff, Pending, etc.)
 - **DON'T:** Update immutable StatefulSet fields (`VolumeClaimTemplates`, `ServiceName`, `Selector`) in CreateOrUpdate
 - **Migration Flow:**
   1. Detect StatefulSet without `VolumeClaimTemplates` but with them in desired spec
-  2. Check if `ReadyReplicas > 0` - if yes, block migration and set Degraded condition
-  3. If `ReadyReplicas == 0`, delete StatefulSet and recreate with persistence
+  2. Check if `Spec.Replicas > 0` or `Status.Replicas > 0` - if yes, block migration and set Degraded condition
+  3. If both `Spec.Replicas == 0` and `Status.Replicas == 0`, delete StatefulSet and recreate with persistence
   4. State machine states: `CreatingStatefulSet` → `WaitingForScaleDown` (if blocked) → `MigratingStatefulSet` → `WaitingForReady`
 - **Example:**
   ```go
   if needsMigration {
-      if existingStatefulSet.Status.ReadyReplicas > 0 {
-          // Block migration, set all conditions
+      specReplicas := int32(0)
+      if existingStatefulSet.Spec.Replicas != nil {
+          specReplicas = *existingStatefulSet.Spec.Replicas
+      }
+      statusReplicas := existingStatefulSet.Status.Replicas
+      if specReplicas > 0 || statusReplicas > 0 {
+          // Block migration - StatefulSet is scaled up (even if unready)
           r.setCondition(valkey, conditionTypeProgressing, metav1.ConditionTrue, reasonWaitingForScaleDown, ...)
           r.setCondition(valkey, conditionTypeDegraded, metav1.ConditionTrue, "MigrationRequiresScaleDown", ...)
           return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
       }
-      // Safe to migrate - delete and recreate
+      // Safe to migrate - StatefulSet is scaled down to 0
       r.Delete(ctx, existingStatefulSet)
   }
   ```

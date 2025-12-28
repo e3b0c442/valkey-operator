@@ -209,14 +209,23 @@ func (r *ValkeyReconciler) reconcileCreatingStatefulSet(ctx context.Context, val
 		// StatefulSet exists - check if it needs migration
 		needsMigration := len(existingStatefulSet.Spec.VolumeClaimTemplates) == 0 && len(desiredStatefulSet.Spec.VolumeClaimTemplates) > 0
 		if needsMigration {
-			// Safety check: Only migrate if StatefulSet has no ready replicas to prevent data loss
-			if existingStatefulSet.Status.ReadyReplicas > 0 {
-				log.Info("StatefulSet has ready replicas, migration requires scaling down first to prevent data loss",
+			// Safety check: Only migrate if StatefulSet is actually scaled down to 0 replicas to prevent data loss
+			// Check both Spec.Replicas and Status.Replicas to ensure pods are terminated, not just unready
+			specReplicas := int32(0)
+			if existingStatefulSet.Spec.Replicas != nil {
+				specReplicas = *existingStatefulSet.Spec.Replicas
+			}
+			statusReplicas := existingStatefulSet.Status.Replicas
+
+			if specReplicas > 0 || statusReplicas > 0 {
+				log.Info("StatefulSet is not scaled down, migration requires scaling down to 0 replicas first to prevent data loss",
 					"statefulset", existingStatefulSet.Name,
+					"specReplicas", specReplicas,
+					"statusReplicas", statusReplicas,
 					"readyReplicas", existingStatefulSet.Status.ReadyReplicas)
-				r.setCondition(valkey, conditionTypeProgressing, metav1.ConditionTrue, reasonWaitingForScaleDown, fmt.Sprintf("Waiting for StatefulSet to be scaled down to 0 replicas before migration. Current ready replicas: %d", existingStatefulSet.Status.ReadyReplicas))
+				r.setCondition(valkey, conditionTypeProgressing, metav1.ConditionTrue, reasonWaitingForScaleDown, fmt.Sprintf("Waiting for StatefulSet to be scaled down to 0 replicas before migration. Current replicas: spec=%d, status=%d", specReplicas, statusReplicas))
 				r.setCondition(valkey, conditionTypeDegraded, metav1.ConditionTrue, "MigrationRequiresScaleDown",
-					fmt.Sprintf("Migration to add persistence requires scaling down StatefulSet first. Current ready replicas: %d. Scale the StatefulSet to 0 replicas to proceed with migration.", existingStatefulSet.Status.ReadyReplicas))
+					fmt.Sprintf("Migration to add persistence requires scaling down StatefulSet to 0 replicas first. Current replicas: spec=%d, status=%d. Scale the StatefulSet to 0 replicas to proceed with migration.", specReplicas, statusReplicas))
 				r.setCondition(valkey, conditionTypeAvailable, metav1.ConditionFalse, "MigrationBlocked", "Migration blocked: StatefulSet must be scaled down to 0 replicas before migration")
 				if updateErr := r.Status().Update(ctx, valkey); updateErr != nil {
 					log.Error(updateErr, "Failed to update status")
@@ -226,9 +235,10 @@ func (r *ValkeyReconciler) reconcileCreatingStatefulSet(ctx context.Context, val
 				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 			}
 
-			log.Info("StatefulSet exists without VolumeClaimTemplates and has no ready replicas, migrating by deleting and recreating",
+			log.Info("StatefulSet exists without VolumeClaimTemplates and is scaled down to 0 replicas, migrating by deleting and recreating",
 				"statefulset", existingStatefulSet.Name,
-				"readyReplicas", existingStatefulSet.Status.ReadyReplicas)
+				"specReplicas", specReplicas,
+				"statusReplicas", statusReplicas)
 			r.setCondition(valkey, conditionTypeProgressing, metav1.ConditionTrue, reasonMigratingStatefulSet, "Migrating StatefulSet to add persistence")
 			r.setCondition(valkey, conditionTypeAvailable, metav1.ConditionFalse, "MigratingStatefulSet", "StatefulSet is being migrated to add persistence")
 			r.setCondition(valkey, conditionTypeDegraded, metav1.ConditionFalse, reasonAvailable, "Migration in progress")
