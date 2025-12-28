@@ -370,6 +370,38 @@ This is a kubebuilder-based Kubernetes operator following the standard kubebuild
 - **DON'T:** Allow invalid states (e.g., both `Available=True` and `Progressing=True` simultaneously)
 - **Example:** When StatefulSet becomes not-ready, set both `Available=False` and `Progressing=True`
 
+#### StatefulSet Migration for Persistence
+- **DO:** Check for existing StatefulSets without `VolumeClaimTemplates` and migrate them safely
+- **DO:** Block migration when StatefulSet is scaled up (Spec.Replicas > 0 or Status.Replicas > 0) to prevent data loss
+- **DO:** Verify StatefulSet is actually scaled down to 0 replicas, not just unready
+- **DO:** Update all state machine conditions (Progressing, Available, Degraded) when migration is blocked
+- **DON'T:** Delete StatefulSets with running pods - this causes data loss
+- **DON'T:** Only check ReadyReplicas - pods can be unready but still running (CrashLoopBackOff, Pending, etc.)
+- **DON'T:** Update immutable StatefulSet fields (`VolumeClaimTemplates`, `ServiceName`, `Selector`) in CreateOrUpdate
+- **Migration Flow:**
+  1. Detect StatefulSet without `VolumeClaimTemplates` but with them in desired spec
+  2. Check if `Spec.Replicas > 0` or `Status.Replicas > 0` - if yes, block migration and set Degraded condition
+  3. If both `Spec.Replicas == 0` and `Status.Replicas == 0`, delete StatefulSet and recreate with persistence
+  4. State machine states: `CreatingStatefulSet` → `WaitingForScaleDown` (if blocked) → `MigratingStatefulSet` → `WaitingForReady`
+- **Example:**
+  ```go
+  if needsMigration {
+      specReplicas := int32(0)
+      if existingStatefulSet.Spec.Replicas != nil {
+          specReplicas = *existingStatefulSet.Spec.Replicas
+      }
+      statusReplicas := existingStatefulSet.Status.Replicas
+      if specReplicas > 0 || statusReplicas > 0 {
+          // Block migration - StatefulSet is scaled up (even if unready)
+          r.setCondition(valkey, conditionTypeProgressing, metav1.ConditionTrue, reasonWaitingForScaleDown, ...)
+          r.setCondition(valkey, conditionTypeDegraded, metav1.ConditionTrue, "MigrationRequiresScaleDown", ...)
+          return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+      }
+      // Safe to migrate - StatefulSet is scaled down to 0
+      r.Delete(ctx, existingStatefulSet)
+  }
+  ```
+
 #### Handle External Deletions
 - **DO:** Check for `errors.IsNotFound(err)` and reset state machine when resources are deleted externally
 - **DON'T:** Return NotFound errors without handling them - this causes infinite error loops
@@ -423,6 +455,27 @@ This is a kubebuilder-based Kubernetes operator following the standard kubebuild
       // Ensure owner reference is set for garbage collection
       if err := ctrl.SetControllerReference(valkey, service, r.Scheme); err != nil {
           return err
+      }
+      return nil
+  })
+  ```
+
+#### Handle Immutable Fields in CreateOrUpdate
+- **DO:** Check if resource exists (UID != "") and only update mutable fields for existing resources
+- **DON'T:** Update immutable fields like `VolumeClaimTemplates`, `ServiceName`, `Selector` in StatefulSets when resource already exists
+- **Rationale:** Kubernetes rejects updates to immutable fields, causing reconciliation failures
+- **Example:**
+  ```go
+  op, err := controllerutil.CreateOrUpdate(ctx, r.Client, statefulSet, func() error {
+      statefulSet.Labels = desiredStatefulSet.Labels
+      if statefulSet.UID != "" {
+          // StatefulSet exists - only update mutable fields
+          statefulSet.Spec.Replicas = desiredStatefulSet.Spec.Replicas
+          statefulSet.Spec.Template = desiredStatefulSet.Spec.Template
+          // Do not update immutable fields: ServiceName, Selector, VolumeClaimTemplates
+      } else {
+          // StatefulSet doesn't exist - set entire spec for creation
+          statefulSet.Spec = desiredStatefulSet.Spec
       }
       return nil
   })

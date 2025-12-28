@@ -307,6 +307,26 @@ spec: {}
 			}
 			Eventually(verifyStatefulSetCreated, 2*time.Minute, time.Second).Should(Succeed())
 
+			By("verifying the PersistentVolumeClaim is created")
+			verifyPVCCreated := func(g Gomega) {
+				pvcName := fmt.Sprintf("data-%s-0", valkeyName)
+				cmd := exec.Command("kubectl", "get", "pvc", pvcName, "-n", valkeyNamespace)
+				_, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "PVC should exist")
+			}
+			Eventually(verifyPVCCreated, 2*time.Minute, time.Second).Should(Succeed())
+
+			By("verifying the PersistentVolumeClaim has correct size")
+			verifyPVCSize := func(g Gomega) {
+				pvcName := fmt.Sprintf("data-%s-0", valkeyName)
+				cmd := exec.Command("kubectl", "get", "pvc", pvcName, "-n", valkeyNamespace,
+					"-o", "jsonpath={.spec.resources.requests.storage}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("1Gi"), "PVC should have 1Gi storage")
+			}
+			Eventually(verifyPVCSize, 2*time.Minute, time.Second).Should(Succeed())
+
 			By("verifying the StatefulSet pod becomes ready")
 			verifyPodReady := func(g Gomega) {
 				cmd := exec.Command("kubectl", "get", "pod", fmt.Sprintf("%s-0", valkeyName), "-n", valkeyNamespace,
